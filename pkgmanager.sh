@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Cores ANSI
+# === Cores ANSI ===
 GREEN="\033[1;32m"
 RED="\033[1;31m"
 YELLOW="\033[1;33m"
@@ -15,12 +15,15 @@ log_ok() { echo -e "[${GREEN}+${RESET}] $1"; }
 log_warn() { echo -e "[${YELLOW}!${RESET}] $1"; }
 log_err() { echo -e "[${RED}-${RESET}] $1"; }
 
+# === Diretórios ===
 REPO_DIR="/opt/meu-distro-pkgs/repo"
 LOGDIR="/var/log/meupm"
 SUMMARY_LOG="$LOGDIR/summary.log"
 
 mkdir -p $LOGDIR
-> $SUMMARY_LOG  # limpa log resumido no início
+> $SUMMARY_LOG  # limpa log resumido
+
+# === Funções ===
 
 update_repo() {
     log_step "Atualizando repositório Git"
@@ -38,9 +41,20 @@ get_depends() {
     FILE=$(ls $REPO_DIR | grep "^$PKG" | tail -n1)
     TMPDIR=$(mktemp -d)
     tar -xJf $REPO_DIR/$FILE -C $TMPDIR ./install/desc 2>/dev/null || true
-    DEPENDS=$(grep "^Depends:" $TMPDIR/install/desc | cut -d':' -f2 | tr -d ' ')
+    DEPENDS=$(grep "^DEPENDS=" $TMPDIR/install/desc | cut -d'=' -f2 | tr -d ' ')
     rm -rf $TMPDIR
     echo $DEPENDS
+}
+
+run_hook() {
+    HOOK_FILE=$1
+    HOOK_TYPE=$2
+    PKG=$3
+    if [ -x "$HOOK_FILE" ]; then
+        log_step "Executando hook $HOOK_TYPE para $(highlight $PKG)"
+        sudo bash "$HOOK_FILE"
+        echo "[HOOK] $HOOK_TYPE $PKG" >> $SUMMARY_LOG
+    fi
 }
 
 install_pkg() {
@@ -65,13 +79,11 @@ install_pkg() {
     fi
 
     log_step "Instalando pacote $(highlight $PKG)"
-
     TMPDIR=$(mktemp -d)
 
-    # Contar arquivos para barra de progresso
+    # Barra de progresso baseada em número de arquivos
     FILE_COUNT=$(tar -tf $REPO_DIR/$FILE | wc -l)
     COUNT=0
-
     tar -xvJf $REPO_DIR/$FILE -C / | while read LINE; do
         COUNT=$((COUNT+1))
         PERCENT=$((COUNT*100/FILE_COUNT))
@@ -81,9 +93,13 @@ install_pkg() {
     done
     echo -e "\n"
 
+    # Salva metadados localmente
     PKGNAME=$(basename $FILE .txz)
     mv $TMPDIR/filelist $LOGDIR/$PKGNAME.files
     tar -O -xJf $REPO_DIR/$FILE ./install/desc > $LOGDIR/$PKGNAME.desc || true
+
+    # Executa hook post-install se existir
+    run_hook "$LOGDIR/$PKGNAME.post-install.sh" "post-install" "$PKGNAME"
 
     grep -qx "$PKGNAME" $LOGDIR/installed 2>/dev/null || echo $PKGNAME >> $LOGDIR/installed
     rm -rf $TMPDIR
@@ -95,18 +111,26 @@ install_pkg() {
 remove_pkg() {
     PKG=$1
     FILELIST=$LOGDIR/$PKG.files
+    DESC=$LOGDIR/$PKG.desc
     if [[ ! -f $FILELIST ]]; then
         log_warn "Pacote $(highlight $PKG) não encontrado nos logs."
-        echo "[WARN] Pacote $PKG não encontrado nos logs" >> $SUMMARY_LOG
+        echo "[WARN] Pacote $PKG não encontrado" >> $SUMMARY_LOG
         return
     fi
+
+    # Executa pre-remove hook se existir
+    run_hook "$LOGDIR/$PKG.pre-remove.sh" "pre-remove" "$PKG"
+
     log_step "Removendo pacote $(highlight $PKG)"
     tac $FILELIST | while read f; do [ -f "$f" ] && rm -f "$f"; done
     tac $FILELIST | while read f; do [ -d "$f" ] && rmdir --ignore-fail-on-non-empty "$f" 2>/dev/null || true; done
-    rm -f $LOGDIR/$PKG.files $LOGDIR/$PKG.desc
+    rm -f $FILELIST $DESC
     sed -i "/^$PKG$/d" $LOGDIR/installed
     log_ok "Pacote $(highlight $PKG) removido"
     echo "[REMOVED] $PKG" >> $SUMMARY_LOG
+
+    # Executa post-remove hook se existir
+    run_hook "$LOGDIR/$PKG.post-remove.sh" "post-remove" "$PKG"
 }
 
 upgrade_pkg() {
@@ -141,6 +165,7 @@ show_summary() {
     cat $SUMMARY_LOG | while read LINE; do echo ">>> $LINE"; done
 }
 
+# === Comandos CLI ===
 case $1 in
     update|up)   update_repo ;;
     install|i)   install_pkg $2 ;;
